@@ -1,86 +1,93 @@
 import express from "express";
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
-app.use(express.json());
+// Fly-friendly port
+const PORT = process.env.PORT || 8080;
 
-// Optional safety: prevent self-loop
-const SERVER_HOST = process.env.REPLIT_DEV_DOMAIN || "";
+app.use(express.json({ limit: "1mb" }));
 
-app.post("/", async (req, res) => {
-  try {
-    if (req.headers["x-relay-hop"] === "1") {
-      return res.status(508).json({ e: "loop detected" });
-    }
-
-    const body = req.body;
-
-    if (!body || !body.u) {
-      return res.status(400).json({ e: "missing url" });
-    }
-
-    let targetUrl;
-    try {
-      targetUrl = new URL(body.u);
-    } catch {
-      return res.status(400).json({ e: "invalid url" });
-    }
-
-    const BLOCKED_HOSTS = [SERVER_HOST].filter(Boolean);
-
-    if (BLOCKED_HOSTS.some(h => targetUrl.hostname.endsWith(h))) {
-      return res.status(400).json({ e: "self-fetch blocked" });
-    }
-
-    // Build headers safely
-    const headers = {};
-    if (body.h && typeof body.h === "object") {
-      for (const [k, v] of Object.entries(body.h)) {
-        headers[k] = String(v);
-      }
-    }
-
-    headers["x-relay-hop"] = "1";
-
-    const fetchOptions = {
-      method: (body.m || "GET").toUpperCase(),
-      headers,
-      redirect: body.r === false ? "manual" : "follow"
-    };
-
-    if (body.b) {
-      fetchOptions.body = Buffer.from(body.b, "base64");
-    }
-
-    const resp = await fetch(targetUrl.toString(), fetchOptions);
-
-    const arrayBuffer = await resp.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    const base64 = buffer.toString("base64");
-
-    const responseHeaders = {};
-    resp.headers.forEach((v, k) => {
-      responseHeaders[k] = v;
-    });
-
-    return res.status(200).json({
-      s: resp.status,
-      h: responseHeaders,
-      b: base64
-    });
-
-  } catch (err) {
-    return res.status(500).json({ e: String(err) });
-  }
-});
-
-// health check
+// Simple health check
 app.get("/", (req, res) => {
   res.json({ status: "relay online" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Relay server running on port ${PORT}`);
+// Basic rate safety (very light)
+const lastRequestTime = new Map();
+
+// Main relay
+app.post("/", async (req, res) => {
+  try {
+    // 🔒 anti-loop header
+    if (req.headers["x-relay-hop"] === "1") {
+      return res.status(508).json({ error: "loop detected" });
+    }
+
+    // 🧾 validate input
+    const { u, m = "GET", h = {}, b, r = true } = req.body || {};
+
+    if (!u) {
+      return res.status(400).json({ error: "missing url" });
+    }
+
+    let targetUrl;
+    try {
+      targetUrl = new URL(u);
+    } catch {
+      return res.status(400).json({ error: "invalid url" });
+    }
+
+    // ⛔ basic SSRF guard (block localhost)
+    const blockedHosts = ["localhost", "127.0.0.1", "::1"];
+    if (blockedHosts.includes(targetUrl.hostname)) {
+      return res.status(403).json({ error: "blocked host" });
+    }
+
+    // 🧠 simple rate limit per IP
+    const ip = req.ip || "unknown";
+    const now = Date.now();
+
+    if (lastRequestTime.has(ip)) {
+      const diff = now - lastRequestTime.get(ip);
+      if (diff < 300) {
+        return res.status(429).json({ error: "too fast" });
+      }
+    }
+    lastRequestTime.set(ip, now);
+
+    // 📦 headers
+    const headers = {};
+    for (const [k, v] of Object.entries(h)) {
+      headers[k] = String(v);
+    }
+
+    headers["x-relay-hop"] = "1";
+
+    // 🌐 fetch request
+    const resp = await fetch(targetUrl, {
+      method: m.toUpperCase(),
+      headers,
+      redirect: r === false ? "manual" : "follow",
+      body: b ? Buffer.from(b, "base64") : undefined
+    });
+
+    const arrayBuffer = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // 📤 response
+    res.json({
+      status: resp.status,
+      headers: Object.fromEntries(resp.headers.entries()),
+      body: buffer.toString("base64")
+    });
+
+  } catch (err) {
+    res.status(500).json({
+      error: err.message || "unknown error"
+    });
+  }
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Relay running on ${PORT}`);
 });
